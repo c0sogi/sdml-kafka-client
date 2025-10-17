@@ -5,6 +5,7 @@ from typing import Any, Callable, Dict, Generic, Iterable, Optional, Type, TypeV
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from aiokafka.structs import ConsumerRecord, TopicPartition
+from beartype.door import is_bearable
 from loguru import logger
 
 T = TypeVar("T")
@@ -44,6 +45,7 @@ def default_corr_from_record(rec: ConsumerRecord, parsed: Optional[object]) -> O
                     pass
 
 
+@dataclass
 class KafkaClient:
     """
     - 여러 타입을 한 번에 지원. (제네릭 X)
@@ -55,55 +57,30 @@ class KafkaClient:
     - 메모리 누수 방지: waiter/큐 정리 철저
     """
 
-    # ---- Kafka 설정 ----
-    def __init__(
-        self,
-        *,
-        bootstrap_servers: str,
-        group_id: Optional[str] = None,  # None이면 수동 assign (빠른 시작)
-        auto_offset_reset: str = "latest",
-        enable_auto_commit: bool = False,
-        # Producer
-        compression: Optional[str] = "gzip",
-        linger_ms: int = 0,
-        request_timeout_ms: int = 5000,
-        metadata_max_age_ms: int = 60000,
-        api_version: str = "auto",
-        # Consumer
-        fetch_max_wait_ms: int = 500,
-        fetch_max_bytes: int = 50 * 1024 * 1024,
-        max_partition_fetch_bytes: int = 50 * 1024 * 1024,
-        fetch_min_bytes: int = 1,
-        # 동작
-        lazy_consumer_start: bool = True,
-        lazy_producer_start: bool = True,
-        seek_to_end_on_assign: bool = True,  # 새 메시지부터만
-        # 파서/매칭
-        parsers: Iterable[ParserSpec[Any]] = (),
-        correlation_from_record: Optional[CorrelationFromRecord] = default_corr_from_record,
-    ) -> None:
-        self.bootstrap_servers = bootstrap_servers
-        self.group_id = group_id
-        self.auto_offset_reset = auto_offset_reset
-        self.enable_auto_commit = enable_auto_commit
+    bootstrap_servers: str
+    group_id: Optional[str] = None  # None이면 수동 assign (빠른 시작)
+    auto_offset_reset: str = "latest"
+    enable_auto_commit: bool = False
+    # Producer
+    compression: Optional[str] = "gzip"
+    linger_ms: int = 0
+    request_timeout_ms: int = 5000
+    metadata_max_age_ms: int = 60000
+    api_version: str = "auto"
+    # Consumer
+    fetch_max_wait_ms: int = 500
+    fetch_max_bytes: int = 50 * 1024 * 1024
+    max_partition_fetch_bytes: int = 50 * 1024 * 1024
+    fetch_min_bytes: int = 1
+    # 동작
+    lazy_consumer_start: bool = True
+    lazy_producer_start: bool = True
+    seek_to_end_on_assign: bool = True  # 새 메시지부터만
+    # 파서/매칭
+    parsers: Iterable[ParserSpec[Any]] = ()
+    correlation_from_record: Optional[CorrelationFromRecord] = default_corr_from_record
 
-        self.compression = compression
-        self.linger_ms = linger_ms
-        self.request_timeout_ms = request_timeout_ms
-        self.metadata_max_age_ms = metadata_max_age_ms
-        self.api_version = api_version
-
-        self.fetch_max_wait_ms = fetch_max_wait_ms
-        self.fetch_max_bytes = fetch_max_bytes
-        self.max_partition_fetch_bytes = max_partition_fetch_bytes
-        self.fetch_min_bytes = fetch_min_bytes
-
-        self.lazy_consumer_start = lazy_consumer_start
-        self.lazy_producer_start = lazy_producer_start
-        self.seek_to_end_on_assign = seek_to_end_on_assign
-
-        self.correlation_from_record = correlation_from_record
-
+    def __post_init__(self) -> None:
         # 내부 상태
         self._producer: Optional[AIOKafkaProducer] = None
         self.consumer: Optional[AIOKafkaConsumer] = None
@@ -118,7 +95,7 @@ class KafkaClient:
 
         # 토픽별 파서 목록
         self._parsers_by_topic: Dict[str, list[ParserSpec[Any]]] = {}
-        for spec in parsers:
+        for spec in self.parsers:
             for t in spec.topics:
                 self._parsers_by_topic.setdefault(t, []).append(spec)
 
@@ -205,7 +182,7 @@ class KafkaClient:
         value: bytes,
         res_topic: str,
         response_partition: Optional[int] = None,
-        key: Optional[str] = None,
+        key: Optional[bytes] = None,
         headers: Optional[list[tuple[str, bytes]]] = None,
         timeout: float = 30.0,
         expect_type: Optional[Type[T]] = None,  # 원하는 타입으로만 완료
@@ -235,15 +212,22 @@ class KafkaClient:
         await self._ensure_consumer_started()
         await self._assign_if_needed([(res_topic, response_partition)])
 
-        corr_id = correlation_id or key or str(uuid.uuid4())
+        if correlation_id:
+            corr_id = correlation_id
+        elif key:
+            corr_id = key.decode("utf-8")
+        else:
+            corr_id = uuid.uuid4().hex
+
         fut: "asyncio.Future[T]" = asyncio.get_event_loop().create_future()
+
         self._waiters[corr_id] = _Waiter[T](future=fut, expect_type=expect_type)
 
         try:
             await self._producer.send_and_wait(
                 req_topic,
                 value=value,
-                key=corr_id.encode("utf-8"),
+                key=key,
                 headers=[(k, v) for (k, v) in (headers or [])],
             )
             logger.debug(f"sent request corr_id={corr_id} topic={req_topic}")
@@ -344,14 +328,14 @@ class KafkaClient:
                         else:
                             # 기대 타입과 일치하는 후보 탐색
                             for obj, ot in parsed_candidates:
-                                if isinstance(obj, expect):
+                                if is_bearable(obj, expect):  # pyright: ignore[reportArgumentType]
                                     waiter.future.set_result(obj)
                                     break
                             else:
                                 waiter.future.set_exception(
                                     TypeError(
-                                        f"Response type mismatch: expected {expect.__name__}, "
-                                        f"got {[ot.__name__ for _, ot in parsed_candidates]}"
+                                        f"Response type mismatch: expected {str(expect)}, "
+                                        f"got [{', '.join(str(ot) for _, ot in parsed_candidates)}]"
                                     )
                                 )
                     # 요청 매칭이면 여기서 끝
