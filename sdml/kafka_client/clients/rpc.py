@@ -3,6 +3,7 @@ import uuid
 from dataclasses import InitVar, dataclass
 from typing import (
     Callable,
+    Iterable,
     Optional,
     Type,
 )
@@ -52,6 +53,7 @@ class KafkaRPC(KafkaBaseClient):
         req_partition: Optional[int] = None,
         req_key: Optional[bytes] = None,
         req_headers: Optional[list[tuple[str, bytes]]] = None,
+        req_headers_reply_to: Optional[Iterable[tuple[str, int | None]]] = None,
         res_timeout: float = 30.0,
         res_expect_type: Optional[Type[T]] = None,
         # Correlation ID Resolution
@@ -81,6 +83,17 @@ class KafkaRPC(KafkaBaseClient):
                 k.lower() == correlation_header_key.lower() for k, _ in msg_headers
             ):
                 msg_headers.append((correlation_header_key, corr_id))
+
+        if req_headers_reply_to:
+            for key, partition in req_headers_reply_to:
+                msg_headers.append(("x-reply-topic", key.encode("utf-8")))
+                if partition is not None:
+                    msg_headers.append((
+                        "x-reply-partition",
+                        partition.to_bytes(
+                            4, byteorder="little", signed=False
+                        ),  # uint32<little>
+                    ))
 
         # 커넥션 시작
         if self._closed:
