@@ -47,9 +47,9 @@ class KafkaRPC(KafkaBaseClient):
 
     async def request(
         self,
+        req_topic: str,
         req_value: bytes,
         *,
-        req_topic: str,
         req_partition: Optional[int] = None,
         req_key: Optional[bytes] = None,
         req_headers: Optional[list[tuple[str, bytes]]] = None,
