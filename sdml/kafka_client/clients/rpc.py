@@ -91,8 +91,8 @@ class KafkaRPC(KafkaBaseClient):
                     msg_headers.append((
                         "x-reply-partition",
                         partition.to_bytes(
-                            4, byteorder="little", signed=False
-                        ),  # uint32<little>
+                            4, byteorder="big", signed=False
+                        ),  # uint32<big>
                     ))
 
         # 커넥션 시작
