@@ -230,7 +230,6 @@ class KafkaBaseClient(ABC):
                 if sub is not None:
                     sub = getattr(sub, "_subscription_type", None)
                     pre_assigned = sub != SubscriptionType.NONE
-                    print(f"pre_assigned: {pre_assigned} {sub}")
 
             # 방어: 이미 subscribe 상태라면 assign과 충돌
             if pre_assigned:
