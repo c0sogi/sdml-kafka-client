@@ -1,3 +1,11 @@
-from .client import KafkaClient, ParserSpec, default_corr_from_record
+from .clients import KafkaBaseClient, KafkaListener, KafkaRPC
+from .types import AssignmentSpec, ParserSpec, TypeStream
 
-__all__ = ["KafkaClient", "ParserSpec", "default_corr_from_record"]
+__all__ = [
+    "KafkaBaseClient",
+    "KafkaListener",
+    "KafkaRPC",
+    "AssignmentSpec",
+    "ParserSpec",
+    "TypeStream",
+]
