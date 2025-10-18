@@ -1,8 +1,11 @@
 import asyncio
-from dataclasses import dataclass
-from typing import Optional, Type
+from dataclasses import InitVar, dataclass
+from typing import Callable, Optional, Type
 
-from aiokafka import ConsumerRecord  # pyright: ignore[reportMissingTypeStubs]
+from aiokafka import (  # pyright: ignore[reportMissingTypeStubs]
+    AIOKafkaConsumer,
+    ConsumerRecord,
+)
 
 from ..types import SENTINEL, T, TypeStream
 from .base_client import KafkaBaseClient
@@ -15,8 +18,13 @@ class KafkaListener(KafkaBaseClient):
     - subscribe(tp): 큐만 반환
     """
 
-    def __post_init__(self) -> None:
+    consumer_factory: InitVar[Callable[[], AIOKafkaConsumer]] = (
+        lambda: AIOKafkaConsumer(bootstrap_servers="127.0.0.1:9092")
+    )
+
+    def __post_init__(self, consumer_factory: Callable[[], AIOKafkaConsumer]) -> None:
         super().__post_init__()
+        self._consumer_factory = consumer_factory
         self._type_queues: dict[Type[object], asyncio.Queue[object]] = {}
 
     async def subscribe(

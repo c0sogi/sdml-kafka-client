@@ -52,4 +52,9 @@ class TypeStream(Generic[T]):
         return item  # type: ignore[return-value]
 
 
+class AutoCommitConfig(TypedDict):
+    every: int | None
+    interval_s: float | None
+
+
 SENTINEL = object()

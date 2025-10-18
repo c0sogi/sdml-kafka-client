@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from types import TracebackType
 from typing import (
+    TYPE_CHECKING,
     Callable,
     Iterable,
     Optional,
@@ -17,12 +18,14 @@ from aiokafka import (  # pyright: ignore[reportMissingTypeStubs]
     ConsumerRecord,
     TopicPartition,
 )
+from aiokafka.consumer.subscription_state import (  # pyright: ignore[reportMissingTypeStubs]
+    SubscriptionType,
+)
 from loguru import logger
 
-from ..types import ParserSpec
+from ..types import AutoCommitConfig, ParserSpec
 
 
-# ---------------- 공통 베이스 ----------------
 @dataclass
 class KafkaBaseClient(ABC):
     """
@@ -31,31 +34,15 @@ class KafkaBaseClient(ABC):
     - 이후 request()/subscribe()는 할당을 변경하지 않음.
     """
 
-    # ---------- Producer ----------
-    bootstrap_servers: str
-    compression: Optional[str] = "gzip"
-    linger_ms: int = 0
-    request_timeout_ms: int = 5000
-    metadata_max_age_ms: int = 60000
-    api_version: str = "auto"
-
-    # ---------- Consumer ----------
-    group_id: Optional[str] = None
-    auto_offset_reset: str = "latest"
-    enable_auto_commit: bool = False
-    fetch_max_wait_ms: int = 500
-    fetch_max_bytes: int = 50 * 1024 * 1024
-    max_partition_fetch_bytes: int = 50 * 1024 * 1024
-    fetch_min_bytes: int = 1
-
     # ---------- Behavior ----------
     lazy_consumer_start: bool = True
     lazy_producer_start: bool = True
     seek_to_end_on_assign: bool = True  # 새 메시지부터
     metadata_refresh_min_interval_s: float = 5.0
-    commit_on_consume: bool = False
-    commit_every: int = 200
-    commit_interval_s: float = 5.0
+    auto_commit: Optional[AutoCommitConfig] = None
+    backoff_min: float = 0.5
+    backoff_max: float = 10.0
+    backoff_factor: float = 2.0
 
     # ---------- Parser / Correlation ----------
     parsers: Iterable[ParserSpec[object]] = ()
@@ -66,17 +53,19 @@ class KafkaBaseClient(ABC):
     )
     correlation_from_record: Optional[
         Callable[[ConsumerRecord[bytes, bytes], Optional[object]], Optional[bytes]]
-    ] = None  # 상관키 추출기: (record, parsed or None) -> correlation_id (없으면 None)
+    ] = None
+    """Correlation key extractor: (record, parsed or None) -> correlation_id (None if not found)"""
 
     # ---------- Assignment ----------
-    auto_expand_new_partitions: bool = (
-        False  # assignments에서 partitions 생략된 토픽의 파티션 증가 자동 반영
-    )
+    auto_expand_new_partitions: bool = False
+    """Automatically expand new partitions in assignments where partitions are omitted"""
 
     def __post_init__(self) -> None:
         # 내부 상태
+        self._producer_factory: Optional[Callable[[], AIOKafkaProducer]] = None
+        self._consumer_factory: Optional[Callable[[], AIOKafkaConsumer]] = None
         self._producer: Optional[AIOKafkaProducer] = None
-        self.consumer: Optional[AIOKafkaConsumer] = None
+        self._consumer: Optional[AIOKafkaConsumer] = None
         self._consumer_task: Optional[asyncio.Task[None]] = None
         self._auto_expand_task: Optional[asyncio.Task[None]] = None
         self._closed: bool = True
@@ -168,22 +157,18 @@ class KafkaBaseClient(ABC):
                 pass
             self._auto_expand_task = None
 
-        if (
-            self.consumer is not None
-            and self.commit_on_consume
-            and not self.enable_auto_commit
-        ):
+        if self._consumer is not None and self.auto_commit:
             try:
-                await self.consumer.commit()  # pyright: ignore[reportUnknownMemberType]
+                await self._consumer.commit()  # pyright: ignore[reportUnknownMemberType]
             except Exception:
                 logger.exception("Final commit failed")
 
-        if self.consumer is not None:
+        if self._consumer is not None:
             try:
-                await self.consumer.stop()
+                await self._consumer.stop()
             except Exception:
                 logger.exception("Error stopping consumer")
-            self.consumer = None
+            self._consumer = None
 
         if self._producer is not None:
             try:
@@ -220,34 +205,43 @@ class KafkaBaseClient(ABC):
         async with self._start_lock:
             if self._producer is not None:
                 return self._producer
-            self._producer = AIOKafkaProducer(
-                bootstrap_servers=self.bootstrap_servers,
-                compression_type=self.compression,
-                linger_ms=self.linger_ms,
-                request_timeout_ms=self.request_timeout_ms,
-                metadata_max_age_ms=self.metadata_max_age_ms,
-                api_version=self.api_version,
-            )
+            if self._producer_factory is None:
+                raise ValueError("producer_factory is not set")
+            self._producer = self._producer_factory()
             await self._producer.start()
             return self._producer
 
     async def _ensure_consumer_started(self) -> AIOKafkaConsumer:
         async with self._start_lock:
-            if self.consumer is not None:
-                return self.consumer
-            self.consumer = AIOKafkaConsumer(
-                bootstrap_servers=self.bootstrap_servers,
-                group_id=self.group_id,
-                enable_auto_commit=self.enable_auto_commit,
-                auto_offset_reset=self.auto_offset_reset,
-                fetch_max_bytes=self.fetch_max_bytes,
-                max_partition_fetch_bytes=self.max_partition_fetch_bytes,
-                fetch_max_wait_ms=self.fetch_max_wait_ms,
-                fetch_min_bytes=self.fetch_min_bytes,
-            )
-            await self.consumer.start()
+            if self._consumer is not None:
+                return self._consumer
+            if self._consumer_factory is None:
+                raise ValueError("consumer_factory is not set")
+            self._consumer = self._consumer_factory()
 
-            # 파서 스펙 기반 정적 할당 1회 적용
+            if TYPE_CHECKING:
+                pre_assigned: bool = (
+                    self._consumer._subscription._subscription_type  # pyright: ignore[reportPrivateUsage]
+                    != SubscriptionType.NONE
+                )
+            else:
+                pre_assigned: bool = False
+                sub = getattr(self._consumer, "_subscription", None)
+                if sub is not None:
+                    sub = getattr(sub, "_subscription_type", None)
+                    pre_assigned = sub != SubscriptionType.NONE
+                    print(f"pre_assigned: {pre_assigned} {sub}")
+
+            # 방어: 이미 subscribe 상태라면 assign과 충돌
+            if pre_assigned:
+                raise RuntimeError(
+                    "AIOKafkaConsumer was created with topics/pattern (subscribe mode). "
+                    "KafkaBaseClient uses assign() based on ParserSpec.assignments. "
+                    "Create the consumer WITHOUT topics."
+                )
+
+            await self._consumer.start()
+
             if self._static_assign_tp_list and not self._assigned:
                 await self._assign_if_needed(
                     self._static_assign_tp_list, source="static", force=True
@@ -256,7 +250,7 @@ class KafkaBaseClient(ABC):
             self._consumer_task = asyncio.create_task(
                 self._consume_loop(), name=f"{self.__class__.__name__}_loop"
             )
-            return self.consumer
+            return self._consumer
 
     async def _assign_if_needed(
         self,
@@ -265,7 +259,7 @@ class KafkaBaseClient(ABC):
         source: str,
         force: bool = False,
     ) -> None:
-        if self.consumer is None:
+        if self._consumer is None:
             return
 
         async with self._assign_lock:
@@ -281,14 +275,14 @@ class KafkaBaseClient(ABC):
                 if part is None:
                     if _should_refresh():
                         try:
-                            await self.consumer.topics()  # fetch_all_metadata()
+                            await self._consumer.topics()  # fetch_all_metadata()
                             self._last_md_refresh = now
                         except Exception:
                             logger.exception(
                                 f"Failed to refresh metadata for topic={topic}"
                             )
 
-                    parts = self.consumer.partitions_for_topic(topic)  # pyright: ignore[reportUnknownMemberType]
+                    parts = self._consumer.partitions_for_topic(topic)  # pyright: ignore[reportUnknownMemberType]
                     if not parts:
                         logger.warning(f"Topic metadata not found or empty: {topic}")
                         continue
@@ -305,7 +299,7 @@ class KafkaBaseClient(ABC):
                 return
 
             all_tps = list(self._assigned | set(new_tps))
-            self.consumer.assign(all_tps)  # pyright: ignore[reportUnknownMemberType]
+            self._consumer.assign(all_tps)  # pyright: ignore[reportUnknownMemberType]
 
             for tp in new_tps:
                 self._assigned.add(tp)
@@ -315,7 +309,7 @@ class KafkaBaseClient(ABC):
             if self.seek_to_end_on_assign:
                 for tp in new_tps:
                     try:
-                        await self.consumer.seek_to_end(tp)  # pyright: ignore[reportUnknownMemberType]
+                        await self._consumer.seek_to_end(tp)  # pyright: ignore[reportUnknownMemberType]
                     except Exception:
                         logger.exception(f"seek_to_end failed for {tp}")
 
@@ -339,13 +333,13 @@ class KafkaBaseClient(ABC):
             try:
                 while True:
                     await asyncio.sleep(backoff)
-                    if self.consumer is None:
+                    if self._consumer is None:
                         continue
                     try:
-                        await self.consumer.topics()  # pyright: ignore[reportUnknownMemberType]
+                        await self._consumer.topics()  # pyright: ignore[reportUnknownMemberType]
                         todo: list[tuple[str, Optional[int]]] = []
                         for topic in topics_with_all_parts:
-                            parts = self.consumer.partitions_for_topic(topic)  # pyright: ignore[reportUnknownMemberType]
+                            parts = self._consumer.partitions_for_topic(topic)  # pyright: ignore[reportUnknownMemberType]
                             if not parts:
                                 continue
                             for p in parts:
@@ -368,20 +362,19 @@ class KafkaBaseClient(ABC):
         )
 
     async def _maybe_commit(self) -> None:
-        if (
-            not self.commit_on_consume
-            or self.enable_auto_commit
-            or self.consumer is None
-        ):
+        if self._consumer is None or not self.auto_commit:
             return
         self._since_commit += 1
         now = time.time()
         if (
-            self._since_commit >= self.commit_every
-            or (now - self._last_commit) >= self.commit_interval_s
+            (every := self.auto_commit["every"]) is not None
+            and self._since_commit >= every
+        ) or (
+            (interval_s := self.auto_commit["interval_s"]) is not None
+            and (now - self._last_commit) >= interval_s
         ):
             try:
-                await self.consumer.commit()  # pyright: ignore[reportUnknownMemberType]
+                await self._consumer.commit()  # pyright: ignore[reportUnknownMemberType]
                 self._since_commit = 0
                 self._last_commit = now
             except Exception:
@@ -426,25 +419,25 @@ class KafkaBaseClient(ABC):
         return parsed_candidates, cid
 
     async def _consume_loop(self) -> None:
-        backoff = 0.5
+        backoff = self.backoff_min
         try:
             while True:
                 try:
-                    assert self.consumer is not None
-                    rec: ConsumerRecord[bytes, bytes] = await self.consumer.getone()  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+                    assert self._consumer is not None
+                    rec: ConsumerRecord[bytes, bytes] = await self._consumer.getone()  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
                     parsed_candidates, cid = self._parse_record(rec)
                     try:
                         await self._on_record(rec, parsed_candidates, cid)
                     except Exception:
                         logger.exception("_on_record failed")
                     await self._maybe_commit()
-                    backoff = 0.5
+                    backoff = self.backoff_min
                 except asyncio.CancelledError:
                     raise
                 except Exception:
                     logger.exception("Unexpected error in consumer loop; will retry")
                     await asyncio.sleep(backoff)
-                    backoff = min(backoff * 2, 10.0)
+                    backoff = min(backoff * self.backoff_factor, self.backoff_max)
         except asyncio.CancelledError:
             pass
 

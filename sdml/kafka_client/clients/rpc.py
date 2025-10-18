@@ -1,17 +1,22 @@
 import asyncio
 import uuid
-from dataclasses import dataclass
+from dataclasses import InitVar, dataclass
 from typing import (
+    Callable,
     Optional,
     Type,
 )
 
-from aiokafka import ConsumerRecord  # pyright: ignore[reportMissingTypeStubs]
+from aiokafka import (  # pyright: ignore[reportMissingTypeStubs]
+    AIOKafkaConsumer,
+    AIOKafkaProducer,
+    ConsumerRecord,
+)
 from beartype.door import is_bearable
 from loguru import logger
 
-from .base_client import KafkaBaseClient
 from ..types import T, Waiter
+from .base_client import KafkaBaseClient
 
 
 @dataclass
@@ -22,8 +27,21 @@ class KafkaRPC(KafkaBaseClient):
     - corr-id로 응답 매칭
     """
 
-    def __post_init__(self) -> None:
+    producer_factory: InitVar[Callable[[], AIOKafkaProducer]] = (
+        lambda: AIOKafkaProducer(bootstrap_servers="127.0.0.1:9092")
+    )
+    consumer_factory: InitVar[Callable[[], AIOKafkaConsumer]] = (
+        lambda: AIOKafkaConsumer(bootstrap_servers="127.0.0.1:9092")
+    )
+
+    def __post_init__(
+        self,
+        producer_factory: Callable[[], AIOKafkaProducer],
+        consumer_factory: Callable[[], AIOKafkaConsumer],
+    ) -> None:
         super().__post_init__()
+        self._producer_factory = producer_factory
+        self._consumer_factory = consumer_factory
         self._waiters: dict[bytes, Waiter[object]] = {}
 
     async def request(
