@@ -46,14 +46,15 @@ class KafkaRPC(KafkaBaseClient):
 
     async def request(
         self,
+        req_value: bytes,
         *,
         req_topic: str,
-        value: bytes,
         req_partition: Optional[int] = None,
-        key: Optional[bytes] = None,
-        headers: Optional[list[tuple[str, bytes]]] = None,
-        timeout: float = 30.0,
-        expect_type: Optional[Type[T]] = None,
+        req_key: Optional[bytes] = None,
+        req_headers: Optional[list[tuple[str, bytes]]] = None,
+        res_timeout: float = 30.0,
+        res_expect_type: Optional[Type[T]] = None,
+        # Correlation ID Resolution
         correlation_id: Optional[bytes] = None,
         propagate_corr_to: str = "both",
         correlation_header_key: str = "request_id",
@@ -64,15 +65,15 @@ class KafkaRPC(KafkaBaseClient):
         # corr-id
         if correlation_id:
             corr_id = correlation_id
-        elif key:
-            corr_id = key
+        elif req_key:
+            corr_id = req_key
         else:
             corr_id = uuid.uuid4().hex.encode("utf-8")
         corr_id = bytes(corr_id)
 
         # 전파
-        msg_key = key
-        msg_headers = list(headers or [])
+        msg_key = req_key
+        msg_headers = list(req_headers or [])
         if propagate_corr_to in ("key", "both") and msg_key is None:
             msg_key = corr_id
         if propagate_corr_to in ("header", "both"):
@@ -89,12 +90,12 @@ class KafkaRPC(KafkaBaseClient):
 
         # waiter
         fut: asyncio.Future[T] = asyncio.get_event_loop().create_future()
-        self._waiters[corr_id] = Waiter[T](future=fut, expect_type=expect_type)
+        self._waiters[corr_id] = Waiter[T](future=fut, expect_type=res_expect_type)
 
         try:
             await producer.send_and_wait(  # pyright: ignore[reportUnknownMemberType]
                 req_topic,
-                value=value,
+                value=req_value,
                 key=msg_key,
                 headers=msg_headers,
                 partition=req_partition,
@@ -103,7 +104,7 @@ class KafkaRPC(KafkaBaseClient):
                 f"sent request corr_id={corr_id} topic={req_topic} partition={req_partition}"
             )
 
-            return await asyncio.wait_for(fut, timeout=timeout)
+            return await asyncio.wait_for(fut, timeout=res_timeout)
 
         except asyncio.TimeoutError:
             self._waiters.pop(corr_id, None)
