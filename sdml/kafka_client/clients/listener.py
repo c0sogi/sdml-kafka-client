@@ -1,22 +1,21 @@
 import asyncio
 from dataclasses import InitVar, dataclass
-from typing import Callable, Optional, Type
+from typing import Callable, Optional, Type, TypeVar, cast
 
 from aiokafka import (  # pyright: ignore[reportMissingTypeStubs]
     AIOKafkaConsumer,
     ConsumerRecord,
 )
 
-from ..types import SENTINEL, T, TypeStream
+from ..types import T, TypeStream
 from .base_client import KafkaBaseClient
+
+V = TypeVar("V", covariant=True)
 
 
 @dataclass
 class KafkaListener(KafkaBaseClient):
-    """
-    - 소비 범위는 ParserSpec.assignments로 정적 확정
-    - subscribe(tp): 큐만 반환
-    """
+    """A Kafka listener that subscribes to a topic and returns a stream of objects"""
 
     consumer_factory: InitVar[Callable[[], AIOKafkaConsumer]] = (
         lambda: AIOKafkaConsumer(bootstrap_servers="127.0.0.1:9092")
@@ -25,20 +24,28 @@ class KafkaListener(KafkaBaseClient):
     def __post_init__(self, consumer_factory: Callable[[], AIOKafkaConsumer]) -> None:
         super().__post_init__()
         self._consumer_factory = consumer_factory
-        self._type_queues: dict[Type[object], asyncio.Queue[object]] = {}
+        self._subscriptions: dict[
+            Type[object], tuple[asyncio.Queue[object], asyncio.Event]
+        ] = {}
 
     async def subscribe(
         self,
         tp: Type[T],
         *,
         queue_maxsize: int = 0,
+        fresh: bool = False,
     ) -> TypeStream[T]:
         if self._closed:
             await self.start()
         await self._ensure_consumer_started()
-
-        self._type_queues.setdefault(tp, asyncio.Queue(maxsize=queue_maxsize))
-        return TypeStream(self._type_queues[tp])
+        if fresh or tp not in self._subscriptions:
+            # Replace with a completely new queue/event
+            self._subscriptions[tp] = (
+                asyncio.Queue(maxsize=queue_maxsize),
+                asyncio.Event(),
+            )
+        q, event = self._subscriptions[tp]
+        return TypeStream[T](cast(asyncio.Queue[T], q), event)
 
     async def _on_record(
         self,
@@ -47,21 +54,23 @@ class KafkaListener(KafkaBaseClient):
         cid: Optional[bytes],
     ) -> None:
         for obj, ot in parsed_candidates:
-            q = self._type_queues.get(ot)
-            if q:
+            q_event = self._subscriptions.get(ot)
+            if q_event is None:
+                continue
+            q, _event = q_event
+            try:
+                q.put_nowait(obj)
+            except asyncio.QueueFull:
                 try:
+                    q.get_nowait()
                     q.put_nowait(obj)
-                except asyncio.QueueFull:
-                    try:
-                        _ = q.get_nowait()
-                        q.put_nowait(obj)
-                    except Exception:
-                        pass
+                except Exception:
+                    pass
 
     async def _on_stop_cleanup(self) -> None:
-        for q in self._type_queues.values():
+        for _q, event in self._subscriptions.values():
             try:
-                q.put_nowait(SENTINEL)
+                event.set()
             except Exception:
                 pass
-        self._type_queues.clear()
+        self._subscriptions.clear()

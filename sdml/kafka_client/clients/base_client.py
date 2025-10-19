@@ -30,8 +30,8 @@ from ..types import AutoCommitConfig, ParserSpec
 class KafkaBaseClient(ABC):
     """
     Static Assignment Mode:
-    - 인스턴스 생성(=파서 등록) 시점에 '무엇을 들을지' 고정.
-    - 이후 request()/subscribe()는 할당을 변경하지 않음.
+    - At instance creation (parser registration), 'what to listen' is fixed.
+    - request()/subscribe() will not change the assignment afterwards.
     """
 
     # ---------- Behavior ----------
@@ -70,43 +70,43 @@ class KafkaBaseClient(ABC):
         self._auto_expand_task: Optional[asyncio.Task[None]] = None
         self._closed: bool = True
 
-        # 동시성 보호
+        # Concurrency protection
         self._start_lock = asyncio.Lock()
         self._assign_lock = asyncio.Lock()
 
-        # 파서 인덱스(토픽→파서 목록)
+        # Parser index (topic -> parser list)
         self._parsers_by_topic: dict[str, list[ParserSpec[object]]] = {}
 
-        # 파서 스펙으로부터 정적 할당 집계
+        # Collect static assignments from parser specs
         self._static_assign_tp_list: list[tuple[str, Optional[int]]] = []
         self._collect_parsers_and_assignments(self.parsers)
 
-        # 현재 assign된 파티션 셋/메타
+        # Currently assigned partitions/metadata
         self._assigned: set[TopicPartition] = set()
         self._assigned_since: dict[TopicPartition, float] = {}
         self._assigned_source: dict[TopicPartition, str] = {}
 
-        # 쓰로틀/커밋 상태
+        # Throttle/commit state
         self._last_md_refresh: float = 0.0
         self._since_commit: int = 0
         self._last_commit: float = time.time()
 
-        # corr-id 기본 추출기(대소문자 무시)
+        # Default correlation key extractor: case-insensitive
         self._corr_header_keys_lower = tuple(k.lower() for k in self.corr_header_keys)
         if self.correlation_from_record is None:
             self.correlation_from_record = self._default_corr_from_record
 
-    # 파서 등록 + 정적 할당 집계(초기화 시 1회)
+    # Register parsers and collect static assignments (once at initialization)
     def _collect_parsers_and_assignments(
         self, specs: Iterable[ParserSpec[object]]
     ) -> None:
         seen_tp: set[tuple[str, Optional[int]]] = set()
         for ps in specs:
-            # 토픽 인덱스 구성
+            # Build topic index
             for a in ps["assignments"]:
                 topic = a["topic"]
                 self._parsers_by_topic.setdefault(topic, []).append(ps)
-            # 정적 할당 구성
+            # Build static assignments
             for a in ps["assignments"]:
                 topic = a["topic"]
                 parts = a.get("partitions", None)
@@ -243,7 +243,7 @@ class KafkaBaseClient(ABC):
 
             if self._static_assign_tp_list and not self._assigned:
                 await self._assign_if_needed(
-                    self._static_assign_tp_list, source="static", force=True
+                    self._static_assign_tp_list, source="static"
                 )
 
             self._consumer_task = asyncio.create_task(
@@ -256,7 +256,6 @@ class KafkaBaseClient(ABC):
         topic_partitions: Iterable[tuple[str, Optional[int]]],
         *,
         source: str,
-        force: bool = False,
     ) -> None:
         if self._consumer is None:
             return
@@ -318,7 +317,7 @@ class KafkaBaseClient(ABC):
             )
 
     def _maybe_start_auto_expand_task(self) -> None:
-        # assignments에서 partitions 생략된 토픽이 하나라도 있어야 의미가 있다.
+        # If there is at least one topic with omitted partitions in assignments, it makes sense to start the auto-expand task
         if self._auto_expand_task:
             return
         topics_with_all_parts = {
@@ -346,9 +345,7 @@ class KafkaBaseClient(ABC):
                                 if tp not in self._assigned:
                                     todo.append((topic, p))
                         if todo:
-                            await self._assign_if_needed(
-                                todo, source="auto-expand", force=True
-                            )
+                            await self._assign_if_needed(todo, source="auto-expand")
                     except asyncio.CancelledError:
                         raise
                     except Exception:
@@ -379,14 +376,14 @@ class KafkaBaseClient(ABC):
             except Exception:
                 logger.exception("Commit failed")
 
-    # ---------- 파싱 + 디스패치 ----------
+    # Parsing + Dispatching
     def _parse_record(
         self, record: ConsumerRecord[bytes, bytes]
     ) -> tuple[list[tuple[object, Type[object]]], Optional[bytes]]:
         topic = record.topic
         specs = self._parsers_by_topic.get(topic)
 
-        # (1) corr-id 추출(파싱 전)
+        # (1) Extract correlation_id (before parsing)
         cid = None
         if self.correlation_from_record:
             try:
@@ -394,7 +391,7 @@ class KafkaBaseClient(ABC):
             except Exception as ex:
                 logger.exception(f"correlation_from_record(None) failed: {ex}")
 
-        # (2) 파싱
+        # (2) Parsing
         parsed_candidates: list[tuple[object, Type[object]]] = []
         if specs:
             for spec in specs:
@@ -440,10 +437,10 @@ class KafkaBaseClient(ABC):
         except asyncio.CancelledError:
             pass
 
-    # ---------- corr-id 기본 추출기(헤더 우선, 대소문자 무시) ----------
     def _default_corr_from_record(
         self, rec: ConsumerRecord[bytes, bytes], parsed: Optional[object]
     ) -> Optional[bytes]:
+        # Default correlation key extractor: Header priority, case-insensitive
         try:
             if rec.headers:
                 for k, v in rec.headers:
@@ -461,7 +458,6 @@ class KafkaBaseClient(ABC):
             pass
         return None
 
-    # ---------- 진단 ----------
     def assigned_table(self) -> list[dict[str, object]]:
         return [
             {
@@ -474,7 +470,6 @@ class KafkaBaseClient(ABC):
             for tp in sorted(self._assigned, key=lambda x: (x.topic, x.partition))
         ]
 
-    # ---------- 훅 ----------
     @abstractmethod
     async def _on_record(
         self,

@@ -23,9 +23,9 @@ from .base_client import KafkaBaseClient
 @dataclass
 class KafkaRPC(KafkaBaseClient):
     """
-    - 응답(수신) 범위: ParserSpec.assignments로 정적 확정
-    - 요청(송신) 토픽/파티션: request() 호출 시 단발 지정
-    - corr-id로 응답 매칭
+    - The range of response (receive): ParserSpec.assignments is statically determined
+    - The request (send) topic/partition: specified once at request() call
+    - Match responses by correlation_id
     """
 
     producer_factory: InitVar[Callable[[], AIOKafkaProducer]] = (
@@ -95,7 +95,7 @@ class KafkaRPC(KafkaBaseClient):
                         ),  # uint32<big>
                     ))
 
-        # 커넥션 시작
+        # Start the connection
         if self._closed:
             await self.start()
         producer = await self._ensure_producer_started()
@@ -140,14 +140,14 @@ class KafkaRPC(KafkaBaseClient):
 
         expect = waiter.expect_type
         if expect is None:
-            waiter.future.set_result(parsed_candidates[0][0])  # type: ignore[arg-type]
+            waiter.future.set_result(parsed_candidates[0][0])
             self._waiters.pop(cid, None)
             return
 
         for obj, _ in parsed_candidates:
             try:
                 if is_bearable(obj, expect):  # pyright: ignore[reportArgumentType]
-                    waiter.future.set_result(obj)  # type: ignore[arg-type]
+                    waiter.future.set_result(obj)
                     self._waiters.pop(cid, None)
                     return
             except Exception:
