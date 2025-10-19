@@ -1,4 +1,5 @@
 import asyncio
+import uuid
 from dataclasses import InitVar, dataclass
 from typing import Callable, Optional, Type, TypeVar, cast
 
@@ -15,10 +16,14 @@ V = TypeVar("V", covariant=True)
 
 @dataclass
 class KafkaListener(KafkaBaseClient):
-    """A Kafka listener that subscribes to a topic and returns a stream of objects"""
+    """A Kafka listener that subscribes to topics and returns a stream of objects"""
 
     consumer_factory: InitVar[Callable[[], AIOKafkaConsumer]] = (
-        lambda: AIOKafkaConsumer(bootstrap_servers="127.0.0.1:9092")
+        lambda: AIOKafkaConsumer(
+            bootstrap_servers="127.0.0.1:9092",
+            group_id=f"listener-{uuid.uuid4().hex}",
+            auto_offset_reset="latest",
+        )
     )
 
     def __post_init__(self, consumer_factory: Callable[[], AIOKafkaConsumer]) -> None:

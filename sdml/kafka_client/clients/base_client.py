@@ -29,9 +29,10 @@ from ..types import AutoCommitConfig, ParserSpec
 @dataclass
 class KafkaBaseClient(ABC):
     """
-    Static Assignment Mode:
-    - At instance creation (parser registration), 'what to listen' is fixed.
-    - request()/subscribe() will not change the assignment afterwards.
+    Group-managed subscription mode:
+    - Topics to listen to are determined from ParserSpec at initialization.
+    - We subscribe the consumer to those topics and let the group coordinator
+      handle partition assignments and rebalancing.
     """
 
     # ---------- Behavior ----------
@@ -56,10 +57,6 @@ class KafkaBaseClient(ABC):
     ] = None
     """Correlation key extractor: (record, parsed or None) -> correlation_id (None if not found)"""
 
-    # ---------- Assignment ----------
-    auto_expand_new_partitions: bool = False
-    """Automatically expand new partitions in assignments where partitions are omitted"""
-
     def __post_init__(self) -> None:
         # 내부 상태
         self._producer_factory: Optional[Callable[[], AIOKafkaProducer]] = None
@@ -72,19 +69,12 @@ class KafkaBaseClient(ABC):
 
         # Concurrency protection
         self._start_lock = asyncio.Lock()
-        self._assign_lock = asyncio.Lock()
 
         # Parser index (topic -> parser list)
         self._parsers_by_topic: dict[str, list[ParserSpec[object]]] = {}
-
-        # Collect static assignments from parser specs
-        self._static_assign_tp_list: list[tuple[str, Optional[int]]] = []
+        # Topics to subscribe to (deduplicated)
+        self._subscription_topics: set[str] = set()
         self._collect_parsers_and_assignments(self.parsers)
-
-        # Currently assigned partitions/metadata
-        self._assigned: set[TopicPartition] = set()
-        self._assigned_since: dict[TopicPartition, float] = {}
-        self._assigned_source: dict[TopicPartition, str] = {}
 
         # Throttle/commit state
         self._last_md_refresh: float = 0.0
@@ -100,26 +90,11 @@ class KafkaBaseClient(ABC):
     def _collect_parsers_and_assignments(
         self, specs: Iterable[ParserSpec[object]]
     ) -> None:
-        seen_tp: set[tuple[str, Optional[int]]] = set()
         for ps in specs:
-            # Build topic index
-            for a in ps["assignments"]:
-                topic = a["topic"]
+            # Build topic index and subscription topics (ignore explicit partitioning)
+            for topic in ps["topics"]:
                 self._parsers_by_topic.setdefault(topic, []).append(ps)
-            # Build static assignments
-            for a in ps["assignments"]:
-                topic = a["topic"]
-                parts = a.get("partitions", None)
-                if parts is None:
-                    if (topic, None) not in seen_tp:
-                        self._static_assign_tp_list.append((topic, None))
-                        seen_tp.add((topic, None))
-                else:
-                    for p in parts:
-                        tp = (topic, int(p))
-                        if tp not in seen_tp:
-                            self._static_assign_tp_list.append((topic, int(p)))
-                            seen_tp.add(tp)
+                self._subscription_topics.add(topic)
 
     # ---------- Lifecycle ----------
     async def start(self) -> None:
@@ -134,8 +109,7 @@ class KafkaBaseClient(ABC):
         self._closed = False
         logger.info(f"{self.__class__.__name__} started")
 
-        if self.auto_expand_new_partitions:
-            self._maybe_start_auto_expand_task()
+        # In subscribe mode, Kafka handles partition changes via rebalancing
 
     async def stop(self) -> None:
         if self._closed:
@@ -148,14 +122,6 @@ class KafkaBaseClient(ABC):
             except asyncio.CancelledError:
                 pass
             self._consumer_task = None
-
-        if self._auto_expand_task:
-            self._auto_expand_task.cancel()
-            try:
-                await self._auto_expand_task
-            except asyncio.CancelledError:
-                pass
-            self._auto_expand_task = None
 
         if self._consumer is not None and self.auto_commit:
             try:
@@ -182,9 +148,6 @@ class KafkaBaseClient(ABC):
         except Exception:
             logger.exception("_on_stop_cleanup failed")
 
-        self._assigned.clear()
-        self._assigned_since.clear()
-        self._assigned_source.clear()
         self._closed = True
         logger.info(f"{self.__class__.__name__} stopped")
 
@@ -220,142 +183,52 @@ class KafkaBaseClient(ABC):
             self._consumer = self._consumer_factory()
 
             if TYPE_CHECKING:
-                pre_assigned: bool = (
+                pre_configured: bool = (
                     self._consumer._subscription._subscription_type  # pyright: ignore[reportPrivateUsage]
                     != SubscriptionType.NONE
                 )
             else:
-                pre_assigned: bool = False
+                pre_configured: bool = False
                 sub = getattr(self._consumer, "_subscription", None)
                 if sub is not None:
                     sub = getattr(sub, "_subscription_type", None)
-                    pre_assigned = sub != SubscriptionType.NONE
+                    pre_configured = sub != SubscriptionType.NONE
 
-            # 방어: 이미 subscribe 상태라면 assign과 충돌
-            if pre_assigned:
+            # Require consumer to be created without pre-configured topics
+            if pre_configured:
                 raise RuntimeError(
-                    "AIOKafkaConsumer was created with topics/pattern (subscribe mode). "
-                    "KafkaBaseClient uses assign() based on ParserSpec.assignments. "
-                    "Create the consumer WITHOUT topics."
+                    "AIOKafkaConsumer was created with topics/pattern or manual assignment. "
+                    "KafkaBaseClient uses subscribe() based on ParserSpec.topics. "
+                    "Create the consumer WITHOUT topics or assigned partitions."
                 )
 
             await self._consumer.start()
 
-            if self._static_assign_tp_list and not self._assigned:
-                await self._assign_if_needed(
-                    self._static_assign_tp_list, source="static"
-                )
+            # Group-managed subscribe to topics derived from ParserSpec
+            if self._subscription_topics:
+                # Guard: group_id must be set for subscribe mode
+                try:
+                    gid = getattr(self._consumer, "_group_id", None)
+                    if gid is None:
+                        gid = getattr(self._consumer, "group_id", None)
+                except Exception:
+                    gid = None
+                if not gid:
+                    raise RuntimeError(
+                        "group_id must be provided on AIOKafkaConsumer for subscribe() mode"
+                    )
+                try:
+                    self._consumer.subscribe(sorted(self._subscription_topics))  # pyright: ignore[reportUnknownMemberType]
+                except Exception:
+                    logger.exception("Failed to subscribe to topics")
+                    raise
 
             self._consumer_task = asyncio.create_task(
                 self._consume_loop(), name=f"{self.__class__.__name__}_loop"
             )
             return self._consumer
 
-    async def _assign_if_needed(
-        self,
-        topic_partitions: Iterable[tuple[str, Optional[int]]],
-        *,
-        source: str,
-    ) -> None:
-        if self._consumer is None:
-            return
-
-        async with self._assign_lock:
-            new_tps: list[TopicPartition] = []
-            now = time.time()
-
-            def _should_refresh() -> bool:
-                return (
-                    now - self._last_md_refresh
-                ) >= self.metadata_refresh_min_interval_s
-
-            for topic, part in topic_partitions:
-                if part is None:
-                    if _should_refresh():
-                        try:
-                            await self._consumer.topics()  # fetch_all_metadata()
-                            self._last_md_refresh = now
-                        except Exception:
-                            logger.exception(
-                                f"Failed to refresh metadata for topic={topic}"
-                            )
-
-                    parts = self._consumer.partitions_for_topic(topic)  # pyright: ignore[reportUnknownMemberType]
-                    if not parts:
-                        logger.warning(f"Topic metadata not found or empty: {topic}")
-                        continue
-                    for p in parts:
-                        tp = TopicPartition(topic, p)
-                        if tp not in self._assigned:
-                            new_tps.append(tp)
-                else:
-                    tp = TopicPartition(topic, part)
-                    if tp not in self._assigned:
-                        new_tps.append(tp)
-
-            if not new_tps:
-                return
-
-            all_tps = list(self._assigned | set(new_tps))
-            self._consumer.assign(all_tps)  # pyright: ignore[reportUnknownMemberType]
-
-            for tp in new_tps:
-                self._assigned.add(tp)
-                self._assigned_since[tp] = time.time()
-                self._assigned_source[tp] = source
-
-            if self.seek_to_end_on_assign:
-                for tp in new_tps:
-                    try:
-                        await self._consumer.seek_to_end(tp)  # pyright: ignore[reportUnknownMemberType]
-                    except Exception:
-                        logger.exception(f"seek_to_end failed for {tp}")
-
-            logger.debug(
-                f"Assigned partitions (added {len(new_tps)}): "
-                f"{sorted(self._assigned, key=lambda x: (x.topic, x.partition))}"
-            )
-
-    def _maybe_start_auto_expand_task(self) -> None:
-        # If there is at least one topic with omitted partitions in assignments, it makes sense to start the auto-expand task
-        if self._auto_expand_task:
-            return
-        topics_with_all_parts = {
-            t for (t, p) in self._static_assign_tp_list if p is None
-        }
-        if not topics_with_all_parts:
-            return
-
-        async def _loop() -> None:
-            backoff = self.metadata_refresh_min_interval_s
-            try:
-                while True:
-                    await asyncio.sleep(backoff)
-                    if self._consumer is None:
-                        continue
-                    try:
-                        await self._consumer.topics()  # pyright: ignore[reportUnknownMemberType]
-                        todo: list[tuple[str, Optional[int]]] = []
-                        for topic in topics_with_all_parts:
-                            parts = self._consumer.partitions_for_topic(topic)  # pyright: ignore[reportUnknownMemberType]
-                            if not parts:
-                                continue
-                            for p in parts:
-                                tp = TopicPartition(topic, p)
-                                if tp not in self._assigned:
-                                    todo.append((topic, p))
-                        if todo:
-                            await self._assign_if_needed(todo, source="auto-expand")
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception:
-                        logger.exception("Auto-expand loop error")
-            except asyncio.CancelledError:
-                pass
-
-        self._auto_expand_task = asyncio.create_task(
-            _loop(), name=f"{self.__class__.__name__}_auto_expand"
-        )
+    # assign/auto-expand are removed in subscribe mode
 
     async def _maybe_commit(self) -> None:
         if self._consumer is None or not self.auto_commit:
@@ -459,15 +332,23 @@ class KafkaBaseClient(ABC):
         return None
 
     def assigned_table(self) -> list[dict[str, object]]:
+        assigned: list[TopicPartition] = []
+        try:
+            if self._consumer is not None:
+                current = self._consumer.assignment()  # pyright: ignore[reportUnknownMemberType]
+                if current:
+                    assigned = sorted(current, key=lambda x: (x.topic, x.partition))
+        except Exception:
+            assigned = []
         return [
             {
                 "topic": tp.topic,
                 "partition": tp.partition,
-                "since": self._assigned_since.get(tp),
-                "source": self._assigned_source.get(tp, "static"),
+                "since": None,
+                "source": "group",
                 "seek_to_end_on_assign": self.seek_to_end_on_assign,
             }
-            for tp in sorted(self._assigned, key=lambda x: (x.topic, x.partition))
+            for tp in assigned
         ]
 
     @abstractmethod

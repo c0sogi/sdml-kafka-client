@@ -3,7 +3,6 @@ import uuid
 from dataclasses import InitVar, dataclass
 from typing import (
     Callable,
-    Iterable,
     Optional,
     Type,
 )
@@ -23,8 +22,8 @@ from .base_client import KafkaBaseClient
 @dataclass
 class KafkaRPC(KafkaBaseClient):
     """
-    - The range of response (receive): ParserSpec.assignments is statically determined
-    - The request (send) topic/partition: specified once at request() call
+    - The range of response (receive): ParserSpec.topics is statically determined
+    - The request (send) topic: specified once at request() call
     - Match responses by correlation_id
     """
 
@@ -32,7 +31,11 @@ class KafkaRPC(KafkaBaseClient):
         lambda: AIOKafkaProducer(bootstrap_servers="127.0.0.1:9092")
     )
     consumer_factory: InitVar[Callable[[], AIOKafkaConsumer]] = (
-        lambda: AIOKafkaConsumer(bootstrap_servers="127.0.0.1:9092")
+        lambda: AIOKafkaConsumer(
+            bootstrap_servers="127.0.0.1:9092",
+            group_id=f"rpc-request-{uuid.uuid4().hex}",
+            auto_offset_reset="latest",
+        )
     )
 
     def __post_init__(
@@ -50,10 +53,9 @@ class KafkaRPC(KafkaBaseClient):
         req_topic: str,
         req_value: bytes,
         *,
-        req_partition: Optional[int] = None,
         req_key: Optional[bytes] = None,
         req_headers: Optional[list[tuple[str, bytes]]] = None,
-        req_headers_reply_to: Optional[Iterable[tuple[str, int | None]]] = None,
+        req_headers_reply_to: Optional[list[str]] = None,
         res_timeout: float = 30.0,
         res_expect_type: Optional[Type[T]] = None,
         # Correlation ID Resolution
@@ -85,15 +87,8 @@ class KafkaRPC(KafkaBaseClient):
                 msg_headers.append((correlation_header_key, corr_id))
 
         if req_headers_reply_to:
-            for key, partition in req_headers_reply_to:
-                msg_headers.append(("x-reply-topic", key.encode("utf-8")))
-                if partition is not None:
-                    msg_headers.append((
-                        "x-reply-partition",
-                        partition.to_bytes(
-                            4, byteorder="big", signed=False
-                        ),  # uint32<big>
-                    ))
+            for topic in req_headers_reply_to:
+                msg_headers.append(("x-reply-topic", topic.encode("utf-8")))
 
         # Start the connection
         if self._closed:
@@ -111,11 +106,8 @@ class KafkaRPC(KafkaBaseClient):
                 value=req_value,
                 key=msg_key,
                 headers=msg_headers,
-                partition=req_partition,
             )
-            logger.debug(
-                f"sent request corr_id={corr_id} topic={req_topic} partition={req_partition}"
-            )
+            logger.debug(f"sent request corr_id={corr_id} topic={req_topic}")
 
             return await asyncio.wait_for(fut, timeout=res_timeout)
 

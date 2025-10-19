@@ -3,9 +3,7 @@ import contextlib
 from typing import (
     Callable,
     Generic,
-    Iterable,
     NamedTuple,
-    NotRequired,
     Optional,
     Self,
     Type,
@@ -18,17 +16,10 @@ from aiokafka import ConsumerRecord  # pyright: ignore[reportMissingTypeStubs]
 T = TypeVar("T", covariant=True)
 
 
-class AssignmentSpec(TypedDict):
-    """The range of Kafka input (consume) that the parser will process"""
-
-    topic: str  # required
-    partitions: NotRequired[Iterable[int]]  # if omitted, all partitions
-
-
 class ParserSpec(TypedDict, Generic[T]):
     """Specify the parser and the range of Kafka input (consume) in one go"""
 
-    assignments: Iterable[AssignmentSpec]
+    topics: list[str]
     type: Type[T]
     parser: Callable[[ConsumerRecord[bytes, bytes]], T]
 
