@@ -18,6 +18,9 @@ from aiokafka import (  # pyright: ignore[reportMissingTypeStubs]
     ConsumerRecord,
     TopicPartition,
 )
+from aiokafka.abc import (  # pyright: ignore[reportMissingTypeStubs]
+    ConsumerRebalanceListener,
+)
 from aiokafka.consumer.subscription_state import (  # pyright: ignore[reportMissingTypeStubs]
     SubscriptionType,
 )
@@ -44,6 +47,8 @@ class KafkaBaseClient(ABC):
     backoff_min: float = 0.5
     backoff_max: float = 10.0
     backoff_factor: float = 2.0
+    assignment_timeout_s: float = 5.0
+    rebalance_listener: Optional[ConsumerRebalanceListener] = None
 
     # ---------- Parser / Correlation ----------
     parsers: Iterable[ParserSpec[object]] = ()
@@ -218,7 +223,10 @@ class KafkaBaseClient(ABC):
                         "group_id must be provided on AIOKafkaConsumer for subscribe() mode"
                     )
                 try:
-                    self._consumer.subscribe(sorted(self._subscription_topics))  # pyright: ignore[reportUnknownMemberType]
+                    self._consumer.subscribe(  # pyright: ignore[reportUnknownMemberType]
+                        sorted(self._subscription_topics),
+                        listener=self.rebalance_listener,
+                    )
                 except Exception:
                     logger.exception("Failed to subscribe to topics")
                     raise

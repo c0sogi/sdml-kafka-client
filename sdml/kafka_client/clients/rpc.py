@@ -12,11 +12,37 @@ from aiokafka import (  # pyright: ignore[reportMissingTypeStubs]
     AIOKafkaProducer,
     ConsumerRecord,
 )
+from aiokafka.abc import ConsumerRebalanceListener  # pyright: ignore[reportMissingTypeStubs]
+from aiokafka.structs import TopicPartition  # pyright: ignore[reportMissingTypeStubs]
 from beartype.door import is_bearable
 from loguru import logger
 
 from ..types import T, Waiter
 from .base_client import KafkaBaseClient
+
+
+class _RPCRebalanceListener(ConsumerRebalanceListener):
+    """Event-driven partition assignment notification for RPC consumer"""
+
+    def __init__(self) -> None:
+        self._assigned_event = asyncio.Event()
+
+    def on_partitions_revoked(self, revoked: list[TopicPartition]) -> None:
+        """Called before rebalance"""
+        self._assigned_event.clear()
+
+    def on_partitions_assigned(self, assigned: list[TopicPartition]) -> None:
+        """Called after partition assignment - signal readiness"""
+        if assigned:
+            self._assigned_event.set()
+
+    async def wait_for_assignment(self, timeout: float) -> bool:
+        """Wait for partitions to be assigned, returns True if assigned"""
+        try:
+            await asyncio.wait_for(self._assigned_event.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
 
 
 @dataclass
@@ -43,10 +69,16 @@ class KafkaRPC(KafkaBaseClient):
         producer_factory: Callable[[], AIOKafkaProducer],
         consumer_factory: Callable[[], AIOKafkaConsumer],
     ) -> None:
+        # Set up rebalance listener BEFORE calling super().__post_init__()
+        # so it's available when consumer subscribes
+        self._rpc_rebalance_listener = _RPCRebalanceListener()
+        self.rebalance_listener = self._rpc_rebalance_listener
+
         super().__post_init__()
         self._producer_factory = producer_factory
         self._consumer_factory = consumer_factory
         self._waiters: dict[bytes, Waiter[object]] = {}
+        self._request_lock = asyncio.Lock()  # Serialize seek + send
 
     async def request(
         self,
@@ -96,19 +128,47 @@ class KafkaRPC(KafkaBaseClient):
         producer = await self._ensure_producer_started()
         await self._ensure_consumer_started()
 
-        # waiter
-        fut: asyncio.Future[T] = asyncio.get_event_loop().create_future()
-        self._waiters[corr_id] = Waiter[T](future=fut, expect_type=res_expect_type)
+        # Serialize seek + send to avoid race conditions with concurrent requests
+        async with self._request_lock:
+            # Wait for partition assignment using event-driven listener
+            if self._consumer:
+                assignment = self._consumer.assignment()  # pyright: ignore[reportUnknownMemberType]
+                if not assignment:
+                    # Wait for partition assignment event (event-driven, no polling!)
+                    assigned = await self._rpc_rebalance_listener.wait_for_assignment(
+                        self.assignment_timeout_s
+                    )
+                    if not assigned:
+                        logger.warning(
+                            f"Partition assignment timeout after {self.assignment_timeout_s}s, proceeding anyway"
+                        )
+                    assignment = self._consumer.assignment()  # pyright: ignore[reportUnknownMemberType]
 
+                # Seek all assigned partitions to end to avoid reading old messages
+                if assignment:
+                    try:
+                        await self._consumer.seek_to_end(*assignment)  # pyright: ignore[reportUnknownMemberType]
+                    except Exception:
+                        logger.exception("Failed to seek to end")
+
+            # waiter (register before sending to avoid race)
+            fut: asyncio.Future[T] = asyncio.get_event_loop().create_future()
+            self._waiters[corr_id] = Waiter[T](future=fut, expect_type=res_expect_type)
+
+            try:
+                await producer.send_and_wait(  # pyright: ignore[reportUnknownMemberType]
+                    req_topic,
+                    value=req_value,
+                    key=msg_key,
+                    headers=msg_headers,
+                )
+                logger.debug(f"sent request corr_id={corr_id} topic={req_topic}")
+            except Exception:
+                self._waiters.pop(corr_id, None)
+                raise
+
+        # Wait for response (outside lock to allow other requests to queue)
         try:
-            await producer.send_and_wait(  # pyright: ignore[reportUnknownMemberType]
-                req_topic,
-                value=req_value,
-                key=msg_key,
-                headers=msg_headers,
-            )
-            logger.debug(f"sent request corr_id={corr_id} topic={req_topic}")
-
             return await asyncio.wait_for(fut, timeout=res_timeout)
 
         except asyncio.TimeoutError:
